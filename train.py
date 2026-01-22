@@ -1,6 +1,7 @@
 import argparse
 
 import torch
+import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,6 +14,7 @@ from model import GPT2WithEngram
 parser = argparse.ArgumentParser()
 parser.add_argument("--push-to-hub", action="store_true", help="Push model to Hugging Face Hub after training")
 parser.add_argument("--repo-id", type=str, default="engram-gpt2-wikitext", help="Hugging Face repository ID")
+parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 args = parser.parse_args()
 
 bs = 32
@@ -47,6 +49,19 @@ data_collator = DataCollatorForLanguageModeling(
 train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=data_collator)
 valid_loader = DataLoader(valid_dataset, batch_size=bs, collate_fn=data_collator)
 
+if not args.no_wandb:
+    wandb.init(
+        project="engram-gpt2-wikitext",
+        config={
+            "learning_rate": lr,
+            "epochs": epochs,
+            "batch_size": bs,
+            "ngram_orders": config.ngram_orders,
+            "engram_dim": config.engram_dim,
+            "bucket_size": config.bucket_size
+        }
+    )
+
 for epoch in range(epochs):
     model.train()
     total_loss = 0
@@ -66,6 +81,8 @@ for epoch in range(epochs):
         optimizer.step()
 
         total_loss += loss.item()
+        if not args.no_wandb:
+            wandb.log({"train_loss": loss.item(), "epoch": epoch})
 
         if step % 10 == 0:
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
@@ -88,6 +105,16 @@ for epoch in range(epochs):
     perplexity = torch.exp(torch.tensor(avg_valid_loss))
 
     print(f"Validation Loss: {avg_valid_loss:.4f} | Perplexity: {perplexity:.2f}")
+
+    if not args.no_wandb:
+        wandb.log({
+            "valid_loss": avg_valid_loss,
+            "perplexity": perplexity,
+            "epoch": epoch + 1
+        })
+
+if not args.no_wandb:
+    wandb.finish()
 
 if args.push_to_hub:
     print(f"Pushing model to Hub: {args.repo_id}...")
