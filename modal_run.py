@@ -11,7 +11,7 @@ volume = modal.Volume.from_name("engram-checkpoints", create_if_missing=True)
 @app.function(
     gpu="A100",
     image=image,
-    timeout=3600,
+    timeout=7200,
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("wandb-secret")

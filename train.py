@@ -15,19 +15,22 @@ from compression import VocabCompressor
 from config import EngramConfig
 from model import GPT2WithEngram
 
+torch.set_float32_matmul_precision('high')
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--push-to-hub", action="store_true", help="Push model to Hugging Face Hub after training")
 parser.add_argument("--repo-id", type=str, default="engram-gpt2-wikitext", help="Hugging Face repository ID")
 parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 args = parser.parse_args()
 
-bs = 32
+bs = 64
 lr = 5e-5
-epochs = 10
+epochs = 1
+val_iters = 500
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
-dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+dataset = load_dataset("wikitext", "wikitext-103-raw-v1")
 tokenizer.pad_token = tokenizer.eos_token
 
 def tokenize_func(examples):
@@ -42,8 +45,8 @@ data_collator = DataCollatorForLanguageModeling(
     tokenizer=tokenizer,
     mlm=False
 )
-train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=data_collator)
-valid_loader = DataLoader(valid_dataset, batch_size=bs, collate_fn=data_collator)
+train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=data_collator, num_workers=4, pin_memory=True)
+valid_loader = DataLoader(valid_dataset, batch_size=bs, collate_fn=data_collator, num_workers=4, pin_memory=True)
 
 config = EngramConfig()
 compressor = VocabCompressor(tokenizer)
@@ -53,8 +56,8 @@ model.gpt2 = torch.compile(model.gpt2)
 model.engram = torch.compile(model.engram)
 
 # Freezing the base GPT2
-for param in model.gpt2.parameters():
-    param.requires_grad = False
+# for param in model.gpt2.parameters():
+#     param.requires_grad = False
 
 engram_params =[p for n, p in model.named_parameters() if "engram" in n]
 gpt2_params = [p for n, p in model.named_parameters() if "engram" not in n]
@@ -93,6 +96,31 @@ if not args.no_wandb:
         }
     )
 
+def evaluate(model, valid_loader, device):
+    model.eval()
+    valid_loss = 0
+    eval_steps = 200
+
+    steps_run = 0
+    with torch.no_grad():
+        for i, batch in enumerate(valid_loader):
+            if i >= eval_steps:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attn_mask = batch["attention_mask"].to(device)
+
+            outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
+            valid_loss += outputs.loss.item()
+            steps_run += 1
+    
+    if steps_run == 0:
+        return 0.0, 0.0
+    avg_valid_loss = valid_loss / eval_steps
+    perplexity = torch.exp(torch.tensor(avg_valid_loss))
+    return avg_valid_loss, perplexity
+
 for epoch in range(epochs):
     model.train()
     total_loss = 0
@@ -115,6 +143,16 @@ for epoch in range(epochs):
         total_loss += loss.item()
         if not args.no_wandb:
             wandb.log({"train_loss": loss.item(), "epoch": epoch})
+
+        if step > 0 and step % val_iters == 0:
+            valid_loss, valid_ppl = evaluate(model, valid_loader, device)
+
+            print(f"\nStep {step}: Valid Loss: {valid_loss:.4f} | Perplexity: {valid_ppl:.2f}")
+
+            if not args.no_wandb:
+                wandb.log({"valid_loss": valid_loss, "perplexity": valid_ppl, "step": step})
+            
+            model.train()
 
         if step % 10 == 0:
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
