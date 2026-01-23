@@ -5,7 +5,11 @@ import wandb
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
+from transformers import (
+    AutoTokenizer,
+    DataCollatorForLanguageModeling,
+    get_linear_schedule_with_warmup,
+)
 
 from compression import VocabCompressor
 from config import EngramConfig
@@ -19,18 +23,10 @@ args = parser.parse_args()
 
 bs = 32
 lr = 5e-5
-epochs = 3
+epochs = 10
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-config = EngramConfig()
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
-compressor = VocabCompressor(tokenizer)
-vocab_map = compressor.build_mapping().to(device)
-model = GPT2WithEngram(config, vocab_map).to(device)
-model.gpt2 = torch.compile(model.gpt2)
-model.engram = torch.compile(model.engram)
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
 tokenizer.pad_token = tokenizer.eos_token
 
@@ -49,7 +45,42 @@ data_collator = DataCollatorForLanguageModeling(
 train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, collate_fn=data_collator)
 valid_loader = DataLoader(valid_dataset, batch_size=bs, collate_fn=data_collator)
 
+config = EngramConfig()
+compressor = VocabCompressor(tokenizer)
+vocab_map = compressor.build_mapping().to(device)
+model = GPT2WithEngram(config, vocab_map).to(device)
+model.gpt2 = torch.compile(model.gpt2)
+model.engram = torch.compile(model.engram)
+
+# Freezing the base GPT2
+for param in model.gpt2.parameters():
+    param.requires_grad = False
+
+engram_params =[p for n, p in model.named_parameters() if "engram" in n]
+gpt2_params = [p for n, p in model.named_parameters() if "engram" not in n]
+
+optimizer = torch.optim.AdamW([
+    {
+        "params": gpt2_params,
+        "lr": lr,
+        "weight_decay": 0.01
+    },
+    {
+        "params": engram_params,
+        "lr": lr * 5,
+        "weight_decay": 0.0
+    }
+])
+
+num_training_steps = len(train_loader) * epochs
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=100,
+    num_training_steps=num_training_steps
+)
+
 if not args.no_wandb:
+    wandb.login()
     wandb.init(
         project="engram-gpt2-wikitext",
         config={
@@ -79,6 +110,7 @@ for epoch in range(epochs):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
         if not args.no_wandb:

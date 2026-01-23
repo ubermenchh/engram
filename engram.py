@@ -32,6 +32,10 @@ class EngramLayer(nn.Module):
             groups=config.d_model
         )
 
+        nn.init.zeros_(self.conv.weight)
+        if self.conv.bias is not None:
+            nn.init.zeros_(self.conv.bias)
+
     def get_ngrams(self, input_ids):
         B, L = input_ids.shape
         canonical_ids = self.vocab_map[input_ids]
