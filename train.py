@@ -8,6 +8,7 @@ from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
     DataCollatorForLanguageModeling,
+    GPT2Config,
     get_linear_schedule_with_warmup,
 )
 
@@ -23,11 +24,23 @@ parser.add_argument("--repo-id", type=str, default="engram-gpt2-wikitext", help=
 parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
 args = parser.parse_args()
 
-bs = 64
-lr = 5e-5
-epochs = 1
+bs = 128
+lr = 1e-3
+epochs = 10
 val_iters = 500
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+nanogpt_config = GPT2Config(
+    vocab_size=50257,
+    n_positions=1024,
+    n_ctx=1024,
+    n_embd=384,
+    n_layer=6,
+    n_head=6,
+    resid_pdrop=0.1,
+    embd_pdrop=0.1,
+    attn_pdrop=0.1
+)
 
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 dataset = load_dataset("wikitext", "wikitext-103-raw-v1")
@@ -51,7 +64,16 @@ valid_loader = DataLoader(valid_dataset, batch_size=bs, collate_fn=data_collator
 config = EngramConfig()
 compressor = VocabCompressor(tokenizer)
 vocab_map = compressor.build_mapping().to(device)
-model = GPT2WithEngram(config, vocab_map).to(device)
+model = GPT2WithEngram(config, vocab_map, nanogpt_config).to(device)
+
+for param in model.parameters():
+    if param.dtype == torch.float32:
+        param.data = param.data.to(dtype=torch.bfloat16)
+
+for buffer in model.buffers():
+    if buffer.dtype == torch.float32:
+        buffer.data = buffer.data.to(dtype=torch.bfloat16)
+
 model.gpt2 = torch.compile(model.gpt2)
 model.engram = torch.compile(model.engram)
 
@@ -85,7 +107,7 @@ scheduler = get_linear_schedule_with_warmup(
 if not args.no_wandb:
     wandb.login()
     wandb.init(
-        project="engram-gpt2-wikitext",
+        project=args.repo_id.split("/")[-1],
         config={
             "learning_rate": lr,
             "epochs": epochs,
@@ -114,7 +136,8 @@ def evaluate(model, valid_loader, device, limit=None):
             valid_loss += outputs.loss.item()
             steps_run += 1
 
-    if steps_run == 0: return 0.0, 0.0
+    if steps_run == 0: 
+        return 0.0, 0.0
 
     avg_valid_loss = valid_loss / steps_run
     perplexity = torch.exp(torch.tensor(avg_valid_loss))
@@ -126,9 +149,9 @@ for epoch in range(epochs):
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
 
     for step, batch in enumerate(progress_bar):
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+        attn_mask = batch["attention_mask"].to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
