@@ -73,7 +73,7 @@ optimizer = torch.optim.AdamW([
         "lr": lr * 5,
         "weight_decay": 0.0
     }
-])
+], fused=True)
 
 num_training_steps = len(train_loader) * epochs
 scheduler = get_linear_schedule_with_warmup(
@@ -96,28 +96,27 @@ if not args.no_wandb:
         }
     )
 
-def evaluate(model, valid_loader, device):
+def evaluate(model, valid_loader, device, limit=None):
     model.eval()
     valid_loss = 0
-    eval_steps = 200
-
     steps_run = 0
+
     with torch.no_grad():
         for i, batch in enumerate(valid_loader):
-            if i >= eval_steps:
+            if limit is not None and i >= limit:
                 break
 
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            attn_mask = batch["attention_mask"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
+            attn_mask = batch["attention_mask"].to(device, non_blocking=True)
 
             outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
             valid_loss += outputs.loss.item()
             steps_run += 1
-    
-    if steps_run == 0:
-        return 0.0, 0.0
-    avg_valid_loss = valid_loss / eval_steps
+
+    if steps_run == 0: return 0.0, 0.0
+
+    avg_valid_loss = valid_loss / steps_run
     perplexity = torch.exp(torch.tensor(avg_valid_loss))
     return avg_valid_loss, perplexity
 
@@ -131,11 +130,13 @@ for epoch in range(epochs):
         labels = batch["labels"].to(device)
         attn_mask = batch["attention_mask"].to(device)
 
-        outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
-        loss = outputs.loss
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
+            loss = outputs.loss
 
         optimizer.zero_grad()
         loss.backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
@@ -145,7 +146,7 @@ for epoch in range(epochs):
             wandb.log({"train_loss": loss.item(), "epoch": epoch})
 
         if step > 0 and step % val_iters == 0:
-            valid_loss, valid_ppl = evaluate(model, valid_loader, device)
+            valid_loss, valid_ppl = evaluate(model, valid_loader, device, limit=200)
 
             print(f"\nStep {step}: Valid Loss: {valid_loss:.4f} | Perplexity: {valid_ppl:.2f}")
 
@@ -160,20 +161,7 @@ for epoch in range(epochs):
     avg_train_loss = total_loss / len(train_loader)
     print(f"Epoch {epoch+1} complete. Avg Train Loss: {avg_train_loss:.4f}")
 
-    model.eval()
-    valid_loss = 0
-    with torch.no_grad():
-        for batch in valid_loader:
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-
-            outputs = model(input_ids, labels=labels, attention_mask=attn_mask)
-            valid_loss += outputs.loss.item()
-
-    avg_valid_loss = valid_loss / len(valid_loader)
-    perplexity = torch.exp(torch.tensor(avg_valid_loss))
-
+    avg_valid_loss, perplexity = evaluate(model, valid_loader, device, limit=None)
     print(f"Validation Loss: {avg_valid_loss:.4f} | Perplexity: {perplexity:.2f}")
 
     if not args.no_wandb:

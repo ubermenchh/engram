@@ -10,7 +10,7 @@ class EngramConfig(PretrainedConfig):
         d_model=768,
         ngram_orders=[2, 3],
         num_heads=8,
-        bucket_size=50_000,
+        bucket_size=100_000,
         engram_dim=384,
         injection_layer=1,
         **kwargs,
